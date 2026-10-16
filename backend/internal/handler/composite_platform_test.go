@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"fmt"
 	"net/http/httptest"
 	"testing"
 
@@ -10,6 +11,80 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/gjson"
 )
+
+func TestMessagesDefaultReasoningEffortMappings(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	for _, tc := range []struct {
+		name       string
+		input      string
+		final      string
+		mapping    service.ReasoningEffortMapping
+		want       string
+		wantDenied bool
+	}{
+		{name: "omitted all models", input: `{}`, final: "none", mapping: service.ReasoningEffortMapping{From: "none", To: "low"}, want: "low"},
+		{name: "empty output config", input: `{"output_config":{}}`, final: "none", mapping: service.ReasoningEffortMapping{From: "none", To: "low"}, want: "low"},
+		{name: "normalized source", input: `{}`, final: "none", mapping: service.ReasoningEffortMapping{From: " NONE ", To: "low"}, want: "low"},
+		{name: "exact upstream model", input: `{"model":"client-alias"}`, final: "none", mapping: service.ReasoningEffortMapping{From: "none", To: "low", Model: "gpt-6.1-sol", MatchType: "exact"}, want: "low"},
+		{name: "prefix upstream model", input: `{}`, final: "none", mapping: service.ReasoningEffortMapping{From: "none", To: "low", Model: "gpt-6.1", MatchType: "prefix"}, want: "low"},
+		{name: "suffix upstream model", input: `{}`, final: "none", mapping: service.ReasoningEffortMapping{From: "none", To: "low", Model: "-sol", MatchType: "suffix"}, want: "low"},
+		{name: "model mismatch", input: `{}`, final: "none", mapping: service.ReasoningEffortMapping{From: "none", To: "low", Model: "other", MatchType: "exact"}, want: "none"},
+		{name: "default medium unaffected", input: `{}`, final: "medium", mapping: service.ReasoningEffortMapping{From: "none", To: "low"}, want: "medium"},
+		{name: "default high unaffected", input: `{}`, final: "high", mapping: service.ReasoningEffortMapping{From: "none", To: "low"}, want: "high"},
+		{name: "no mapping", input: `{}`, final: "high", want: "high"},
+		{name: "other source mapping ignored", input: `{}`, final: "high", mapping: service.ReasoningEffortMapping{From: "high", To: "low"}, want: "high"},
+		{name: "none deny", input: `{}`, final: "none", mapping: service.ReasoningEffortMapping{From: "none", To: service.ReasoningEffortMappingDeny}, wantDenied: true},
+		{name: "null unchanged", input: `{"output_config":{"effort":null}}`, final: "none", mapping: service.ReasoningEffortMapping{From: "none", To: "low"}, want: "none"},
+		{name: "number unchanged", input: `{"output_config":{"effort":1}}`, final: "none", mapping: service.ReasoningEffortMapping{From: "none", To: "low"}, want: "none"},
+		{name: "blank unchanged", input: `{"output_config":{"effort":"  "}}`, final: "none", mapping: service.ReasoningEffortMapping{From: "none", To: "low"}, want: "none"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Request = httptest.NewRequest("POST", "/v1/messages", nil)
+			group := &service.Group{
+				Platform: service.PlatformOpenAI, MaxReasoningEffort: "low",
+				MaxReasoningEffortOverLimit: service.ReasoningEffortOverLimitDeny,
+				ReasoningEffortMappings:     []service.ReasoningEffortMapping{tc.mapping},
+			}
+			bindOpenAIReasoningEffortPolicyForMessagesRequest(c, &service.APIKey{Group: group}, []byte(tc.input))
+			body := []byte(fmt.Sprintf(`{"model":"gpt-6.1-sol","reasoning":{"effort":%q}}`, tc.final))
+			got, changed, err := service.ApplyOpenAIReasoningEffortPolicyFromContext(c.Request.Context(), body)
+			if tc.wantDenied {
+				var denied *service.ReasoningEffortMappingDeniedError
+				require.ErrorAs(t, err, &denied)
+				require.Equal(t, "none", denied.Requested)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tc.want, gjson.GetBytes(got, "reasoning.effort").String())
+			require.Equal(t, tc.want != tc.final, changed)
+			require.Equal(t, tc.mapping, group.ReasoningEffortMappings[0], "binding must not mutate group policy")
+		})
+	}
+}
+
+func TestMessagesDefaultReasoningEffortPreservesScopedRuleOrder(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest("POST", "/v1/messages", nil)
+	mappings := []service.ReasoningEffortMapping{
+		{From: "high", To: "low"},
+		{From: "none", To: "medium", Model: "gpt-", MatchType: "prefix"},
+		{From: "none", To: "high", Model: "gpt-", MatchType: "prefix"},
+		{From: "none", To: "low"},
+	}
+	group := &service.Group{Platform: service.PlatformOpenAI, MaxReasoningEffort: "low", ReasoningEffortMappings: mappings}
+	bindOpenAIReasoningEffortPolicyForMessagesRequest(c, &service.APIKey{Group: group}, []byte(`{}`))
+	body := []byte(`{"model":"gpt-6.1-sol","reasoning":{"effort":"none"}}`)
+	expected, _, err := service.ApplyOpenAIReasoningEffortPolicy(body, "", mappings, "")
+	require.NoError(t, err)
+	got, changed, err := service.ApplyOpenAIReasoningEffortPolicyFromContext(c.Request.Context(), body)
+	require.NoError(t, err)
+	require.True(t, changed)
+	require.JSONEq(t, string(expected), string(got))
+	require.Equal(t, "medium", gjson.GetBytes(got, "reasoning.effort").String())
+	require.Equal(t, "high", group.ReasoningEffortMappings[0].From)
+}
 
 func TestCompositeTargetPlatformAllowedResolvesKnownAllowedModel(t *testing.T) {
 	gin.SetMode(gin.TestMode)

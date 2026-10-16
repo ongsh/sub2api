@@ -15,6 +15,7 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/pkg/apicompat"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/claude"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/openai"
 	"github.com/Wei-Shaw/sub2api/internal/util/responseheaders"
 	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
@@ -98,7 +99,21 @@ func (s *OpenAIGatewayService) ForwardAsAnthropic(
 	// 2. Model mapping
 	billingModel := resolveOpenAIForwardModel(account, normalizedModel, defaultMappedModel)
 	upstreamModel := normalizeOpenAIModelForUpstream(account, billingModel)
-	if err := validateGPT61SolCompatRequest(body, upstreamModel); err != nil {
+	// Disabled thinking takes precedence even when the client also supplies
+	// a non-empty effort (e.g. Desktop auxiliary requests send high + disabled).
+	// Let the existing policy map the resulting none before model validation.
+	// Invalid/empty fields and effort derived only from a model alias retain
+	// strict conversion; raw unsupported selections still fail ingress checks.
+	inputEffort := gjson.GetBytes(body, "output_config.effort")
+	hasExplicitEffort := inputEffort.Type == gjson.String && strings.TrimSpace(inputEffort.String()) != ""
+	deferReasoningValidation := account.Platform == PlatformOpenAI &&
+		(hasExplicitEffort || (!inputEffort.Exists() &&
+			(anthropicReq.OutputConfig == nil || anthropicReq.OutputConfig.Effort == "")))
+	validateRequest := validateGPT61SolCompatRequest
+	if deferReasoningValidation {
+		validateRequest = validateGPT61SolCompatRequestFields
+	}
+	if err := validateRequest(body, upstreamModel); err != nil {
 		writeAnthropicError(c, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return nil, err
 	}
@@ -154,7 +169,13 @@ func (s *OpenAIGatewayService) ForwardAsAnthropic(
 
 	// 3. Convert Anthropic → Responses after compatibility-only replay guard.
 	anthropicReq.Model = upstreamModel
-	responsesReq, err := anthropicToResponses(s.cfg, &anthropicReq)
+	var responsesReq *apicompat.ResponsesRequest
+	var err error
+	if deferReasoningValidation {
+		responsesReq, err = apicompat.AnthropicToResponsesWithDeferredReasoningValidation(&anthropicReq, configuredMinOutputTokens(s.cfg))
+	} else {
+		responsesReq, err = anthropicToResponses(s.cfg, &anthropicReq)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("convert anthropic to responses: %w", err)
 	}
@@ -312,6 +333,13 @@ func (s *OpenAIGatewayService) ForwardAsAnthropic(
 			if responsesReq.Reasoning != nil {
 				responsesReq.Reasoning.Effort = gjson.GetBytes(responsesBody, "reasoning.effort").String()
 			}
+		}
+	}
+
+	if deferReasoningValidation {
+		if err := openai.ValidateGPT61SolReasoningEffort(upstreamModel, gjson.GetBytes(responsesBody, "reasoning.effort").String()); err != nil {
+			writeAnthropicError(c, http.StatusBadRequest, "invalid_request_error", err.Error())
+			return nil, err
 		}
 	}
 

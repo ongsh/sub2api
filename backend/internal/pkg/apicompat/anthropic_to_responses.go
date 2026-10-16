@@ -19,8 +19,22 @@ func AnthropicToResponses(req *AnthropicRequest) (*ResponsesRequest, error) {
 // AnthropicToResponsesWithMinOutputTokens converts an Anthropic request using
 // the supplied max_output_tokens floor.
 func AnthropicToResponsesWithMinOutputTokens(req *AnthropicRequest, minOutputTokens int) (*ResponsesRequest, error) {
-	if err := openai.ValidateGPT61SolReasoningEffort(req.Model, anthropicReasoningEffort(req)); err != nil {
-		return nil, err
+	return anthropicToResponses(req, minOutputTokens, false)
+}
+
+// AnthropicToResponsesWithDeferredReasoningValidation is for gateway callers
+// that apply a group policy after conversion. The caller MUST validate the
+// final model and reasoning effort after that policy and before forwarding.
+// Standalone conversion must use AnthropicToResponsesWithMinOutputTokens.
+func AnthropicToResponsesWithDeferredReasoningValidation(req *AnthropicRequest, minOutputTokens int) (*ResponsesRequest, error) {
+	return anthropicToResponses(req, minOutputTokens, true)
+}
+
+func anthropicToResponses(req *AnthropicRequest, minOutputTokens int, deferReasoningValidation bool) (*ResponsesRequest, error) {
+	if !deferReasoningValidation {
+		if err := openai.ValidateGPT61SolReasoningEffort(req.Model, anthropicReasoningEffort(req)); err != nil {
+			return nil, err
+		}
 	}
 	input, err := convertAnthropicToResponsesInput(req.System, req.Messages)
 	if err != nil {
